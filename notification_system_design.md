@@ -1177,3 +1177,622 @@ ON notifications(notificationType, createdAt);
 CREATE INDEX idx_student_notifications_notification_student
 ON student_notifications(notification_id, student_id);
 ```
+
+# Stage 4
+
+# Reducing Database Load On Page Loads
+
+Currently notifications are fetched on every page load for every student. This can overwhelm the database because many students may open different pages at the same time, and every page load creates repeated notification list and unread count queries.
+
+The main issue is that the application is treating notifications like a normal page resource instead of a mostly event-driven feature.
+
+## Suggested Solution
+
+I would improve the design using a combination of caching, real-time updates, pagination, conditional fetching, and better query/index design.
+
+## 1. Fetch Notifications Only When Needed
+
+Instead of calling notification APIs on every page load, the frontend should fetch notifications when:
+
+- The user opens the notification panel.
+- The app starts for the first time.
+- WebSocket reconnects and needs to sync missed messages.
+- The unread count is stale.
+
+For normal page navigation inside the app, the frontend can reuse already loaded notification data.
+
+Tradeoff:
+
+- Reduces database load immediately.
+- Frontend state management becomes slightly more important.
+- There is a small chance of stale data if the frontend does not sync correctly.
+
+## 2. Use WebSocket For Real-Time Updates
+
+As designed in Stage 1, WebSocket should push new notifications to students. If the student is already online, the frontend should not keep polling the database.
+
+Flow:
+
+1. Student opens the app.
+2. Frontend fetches current unread count and first page of notifications once.
+3. Frontend opens WebSocket connection.
+4. New notifications are pushed through WebSocket.
+5. Frontend updates notification list and unread count locally.
+
+Tradeoff:
+
+- Gives faster user experience.
+- Reduces repeated DB reads.
+- Requires handling disconnects and reconnects.
+- WebSocket servers need scaling when many users are online.
+
+## 3. Cache Unread Count In Redis
+
+Unread count is shown on almost every page in the notification bell. Instead of calculating it from the database every time, store it in Redis.
+
+Example key:
+
+```text
+unread_count:stu_2300320100222
+```
+
+When a notification is delivered:
+
+```text
+INCR unread_count:stu_2300320100222
+```
+
+When notification is marked as read:
+
+```text
+DECR unread_count:stu_2300320100222
+```
+
+Tradeoff:
+
+- Very fast reads for badge count.
+- Reduces load on PostgreSQL.
+- Cache can become inconsistent if update logic fails.
+- Need fallback recalculation from DB if cache key is missing or incorrect.
+
+## 4. Use Pagination And Limit Fields
+
+The notification list API should always use pagination.
+
+Good request:
+
+```http
+GET /notifications?page=1&limit=20
+```
+
+The API should avoid `SELECT *` and return only fields required by frontend list view.
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.category,
+  n.priority,
+  sn.is_read,
+  n.created_at,
+  n.action_url
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = 'stu_2300320100222'
+  AND n.deleted_at IS NULL
+ORDER BY sn.delivered_at DESC
+LIMIT 20 OFFSET 0;
+```
+
+Tradeoff:
+
+- Keeps response small and fast.
+- User may need multiple API calls while scrolling.
+- Offset pagination may become slower for very deep pages.
+
+For better large-scale performance, cursor pagination can be used:
+
+```http
+GET /notifications?limit=20&before=2026-06-09T11:00:00Z
+```
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.category,
+  n.priority,
+  sn.is_read,
+  sn.delivered_at
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = 'stu_2300320100222'
+  AND sn.delivered_at < '2026-06-09 11:00:00'
+  AND n.deleted_at IS NULL
+ORDER BY sn.delivered_at DESC
+LIMIT 20;
+```
+
+Tradeoff:
+
+- Cursor pagination is faster for large data.
+- It is slightly more complex than page number based pagination.
+
+## 5. Add Proper Composite Indexes
+
+The most important index for student notification list:
+
+```sql
+CREATE INDEX idx_student_notifications_student_delivered
+ON student_notifications(student_id, delivered_at DESC);
+```
+
+For unread notifications:
+
+```sql
+CREATE INDEX idx_student_notifications_student_read_delivered
+ON student_notifications(student_id, is_read, delivered_at DESC);
+```
+
+Tradeoff:
+
+- Makes common reads fast.
+- Increases storage usage.
+- Inserts and updates become a little slower because indexes must be updated.
+
+## 6. Use HTTP Cache Validation
+
+For notification list, backend can return an `ETag` or `Last-Modified` header.
+
+Response:
+
+```http
+ETag: "student-1042-notifications-v25"
+Last-Modified: Tue, 09 Jun 2026 11:30:00 GMT
+```
+
+Next request:
+
+```http
+If-None-Match: "student-1042-notifications-v25"
+```
+
+If nothing changed:
+
+```http
+304 Not Modified
+```
+
+Tradeoff:
+
+- Reduces response size.
+- Still creates some backend work.
+- Best used with caching and WebSocket, not as the only solution.
+
+## 7. Read Replica For Heavy Reads
+
+If read traffic is very high, notification reads can go to a PostgreSQL read replica.
+
+Tradeoff:
+
+- Protects primary DB from read overload.
+- Adds infrastructure cost.
+- Replica may have small replication delay.
+
+## Final Stage 4 Approach
+
+I would use:
+
+- WebSocket for new notification delivery.
+- Redis for unread count.
+- Fetch notification list only when notification panel opens.
+- Cursor pagination for older notifications.
+- Composite indexes for common access patterns.
+- PostgreSQL as source of truth.
+
+This reduces repeated page-load queries and keeps the user experience fast.
+
+# Stage 5
+
+# Reliable Notify All Design
+
+The proposed pseudocode is:
+
+```text
+function notify_all(student_ids: array, message: string):
+  for student_id in student_ids:
+    send_email(student_id, message)
+    save_to_db(student_id, message)
+    push_to_app(student_id, message)
+```
+
+This implementation is simple, but it is not reliable for 50,000 students.
+
+## Shortcomings
+
+Main problems:
+
+- It processes students one by one, so it will be slow.
+- If `send_email` fails midway, the remaining students may not receive anything.
+- Email, DB insert, and app push are tightly coupled.
+- There is no retry mechanism.
+- There is no failure tracking for individual students.
+- There is no idempotency, so retries may send duplicate emails or duplicate notifications.
+- One slow email API call can block the whole process.
+- If server crashes halfway, the system may not know where to resume.
+- HR gets no clear delivery status.
+
+## What If Email Failed For 200 Students?
+
+If logs show that `send_email` failed for 200 students midway, we should not rerun the complete process blindly. That may duplicate emails and in-app notifications for students who already received them.
+
+Correct action:
+
+1. Identify the failed student IDs from logs or delivery status table.
+2. Mark their email delivery status as `failed`.
+3. Retry only failed email jobs.
+4. Keep DB notification records unchanged if they were already created.
+5. Make retries idempotent using a unique notification id and student id.
+
+Example retry query:
+
+```sql
+SELECT
+  student_id,
+  notification_id
+FROM notification_delivery_logs
+WHERE
+  notification_id = 'notif_bulk_1001'
+  AND channel = 'email'
+  AND status = 'failed';
+```
+
+Then retry email only for these 200 students.
+
+## Should DB Save And Email Sending Happen Together?
+
+No, they should not happen together in the same synchronous flow.
+
+Saving to DB should happen first because the database is the source of truth. Once the notification is stored, email and in-app delivery can happen asynchronously through background workers.
+
+Reason:
+
+- DB insert is internal and usually reliable.
+- Email API is external and can fail due to rate limits, downtime, or network issues.
+- If both happen together, one email failure can break the whole notification process.
+- The system needs retry support for email without creating duplicate DB records.
+- In-app notification can be delivered immediately if the student is online, but the stored notification should exist first.
+
+Better order:
+
+1. Create one notification record.
+2. Create delivery rows for students.
+3. Publish email jobs and in-app jobs to a queue.
+4. Workers process jobs in parallel.
+5. Track success/failure per student and per channel.
+
+## Additional Table For Delivery Tracking
+
+To make failures trackable, add a delivery log table.
+
+```sql
+CREATE TABLE notification_delivery_logs (
+  id BIGSERIAL PRIMARY KEY,
+  notification_id VARCHAR(50) NOT NULL,
+  student_id VARCHAR(50) NOT NULL,
+  channel VARCHAR(20) NOT NULL CHECK (channel IN ('email', 'in_app')),
+  status VARCHAR(20) NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP,
+  UNIQUE (notification_id, student_id, channel)
+);
+```
+
+Useful index:
+
+```sql
+CREATE INDEX idx_delivery_logs_status_channel
+ON notification_delivery_logs(channel, status, updated_at);
+```
+
+## Redesigned Reliable Flow
+
+The API should not send all emails directly. It should enqueue jobs.
+
+Revised pseudocode:
+
+```text
+function notify_all(student_ids, message):
+  notification_id = generate_id()
+
+  begin_transaction()
+
+  save_notification(
+    id = notification_id,
+    title = "Placement Notification",
+    message = message,
+    notificationType = "Placement"
+  )
+
+  for batch in chunks(student_ids, 1000):
+    bulk_insert_student_notifications(batch, notification_id)
+    bulk_insert_delivery_logs(batch, notification_id, "email", "pending")
+    bulk_insert_delivery_logs(batch, notification_id, "in_app", "pending")
+
+  commit_transaction()
+
+  enqueue_job("send_email_bulk", notification_id)
+  enqueue_job("push_in_app_bulk", notification_id)
+
+  return {
+    "notification_id": notification_id,
+    "status": "accepted"
+  }
+```
+
+Email worker:
+
+```text
+function send_email_worker(notification_id):
+  pending_rows = get_pending_delivery_logs(
+    notification_id = notification_id,
+    channel = "email",
+    limit = 500
+  )
+
+  for row in pending_rows:
+    try:
+      send_email(row.student_id, notification_id)
+      mark_delivery_status(row.student_id, notification_id, "email", "sent")
+    catch error:
+      increment_attempt_count(row.student_id, notification_id, "email")
+
+      if attempt_count < 3:
+        enqueue_retry("send_email", row.student_id, notification_id)
+      else:
+        mark_delivery_status(
+          row.student_id,
+          notification_id,
+          "email",
+          "failed",
+          error.message
+        )
+```
+
+In-app worker:
+
+```text
+function push_in_app_worker(notification_id):
+  pending_rows = get_pending_delivery_logs(
+    notification_id = notification_id,
+    channel = "in_app",
+    limit = 1000
+  )
+
+  for row in pending_rows:
+    try:
+      push_to_app(row.student_id, notification_id)
+      mark_delivery_status(row.student_id, notification_id, "in_app", "sent")
+    catch error:
+      mark_delivery_status(
+        row.student_id,
+        notification_id,
+        "in_app",
+        "failed",
+        error.message
+      )
+```
+
+Retry failed emails:
+
+```text
+function retry_failed_emails(notification_id):
+  failed_rows = get_failed_delivery_logs(
+    notification_id = notification_id,
+    channel = "email",
+    max_attempts_less_than = 3
+  )
+
+  for row in failed_rows:
+    enqueue_retry("send_email", row.student_id, notification_id)
+```
+
+## SQL For Failed Email Retry
+
+```sql
+SELECT
+  student_id,
+  notification_id
+FROM notification_delivery_logs
+WHERE
+  notification_id = 'notif_bulk_1001'
+  AND channel = 'email'
+  AND status = 'failed'
+  AND attempt_count < 3;
+```
+
+Reset failed rows to pending before retry:
+
+```sql
+UPDATE notification_delivery_logs
+SET
+  status = 'pending',
+  updated_at = CURRENT_TIMESTAMP
+WHERE
+  notification_id = 'notif_bulk_1001'
+  AND channel = 'email'
+  AND status = 'failed'
+  AND attempt_count < 3;
+```
+
+## Making It Fast
+
+To handle 50,000 students:
+
+- Use bulk inserts instead of one DB insert per student.
+- Use queue workers for email and in-app delivery.
+- Process jobs in batches.
+- Run multiple workers in parallel.
+- Respect email provider rate limits.
+- Use idempotency keys to avoid duplicate sends.
+
+Example idempotency key:
+
+```text
+notif_bulk_1001:stu_2300320100222:email
+```
+
+## Final Stage 5 Approach
+
+The reliable design should save notification data first, then process email and in-app delivery asynchronously using queues and workers. Each student and channel should have a delivery status. If 200 email sends fail, only those failed email jobs should be retried, without recreating the notification or resending to all 50,000 students.
+
+# Stage 6
+
+# Priority Inbox Implementation
+
+The product requirement is to show the top `n` most important unread notifications first. For this stage, I implemented code to find the top 10 priority notifications from the provided Notification API.
+
+Code file:
+
+```text
+stage6_priority_inbox.py
+```
+
+Screenshot output:
+
+```text
+stage6_priority_output.png
+```
+
+HTML output:
+
+```text
+stage6_priority_output.html
+```
+
+Log file:
+
+```text
+logs/stage6.log
+```
+
+## Priority Rule
+
+Priority is calculated using notification type weight first and recency second.
+
+Type weights:
+
+```text
+Placement = 3
+Result = 2
+Event = 1
+```
+
+Sorting rule:
+
+```text
+higher type weight first
+if type weight is same, latest timestamp first
+```
+
+Example:
+
+- A recent `Placement` notification is ranked above a `Result`.
+- A recent `Result` notification is ranked above an `Event`.
+- Between two `Placement` notifications, the newer one is ranked first.
+
+## Implementation Approach
+
+The code fetches notifications from:
+
+```text
+http://4.224.186.213/evaluation-service/notifications
+```
+
+The route is protected, so the code reads the access token from `.env`. If the saved token is rejected, the script tries to refresh the token using the client details available locally.
+
+The code does not hard-code notifications. It only uses the API response.
+
+The implementation uses a min-heap of size 10:
+
+```text
+heap size = 10
+```
+
+For each notification:
+
+1. Calculate type weight.
+2. Parse timestamp.
+3. Create priority score `(type_weight, timestamp)`.
+4. Add it to the heap if there is space.
+5. If heap already has 10 items, replace the lowest priority item only when the new item is better.
+
+At the end, the heap contains only the top 10 notifications.
+
+## Computation Cost
+
+If total notifications are `m` and top count is `n`:
+
+```text
+O(m log n)
+```
+
+For this stage:
+
+```text
+n = 10
+```
+
+So each new notification update costs:
+
+```text
+O(log 10)
+```
+
+Since 10 is very small, this is almost constant time in practice.
+
+## Maintaining Top 10 When New Notifications Keep Coming
+
+New notifications will keep coming through WebSocket as planned in Stage 1. The frontend or backend can maintain the current top 10 using the same heap approach.
+
+For each new unread notification:
+
+1. Calculate its score.
+2. If fewer than 10 items exist, add it.
+3. If 10 items already exist, compare it with the lowest priority item.
+4. If the new notification has higher priority, replace the lowest item.
+5. If a notification is marked as read, remove it from the priority inbox and refill from the next best unread item.
+
+For a production system, the backend can maintain a Redis sorted set per student:
+
+```text
+priority_inbox:stu_2300320100222
+```
+
+The score can be formed using type weight and timestamp:
+
+```text
+score = type_weight * 10000000000 + unix_timestamp
+```
+
+To fetch top 10:
+
+```text
+ZREVRANGE priority_inbox:stu_2300320100222 0 9
+```
+
+Tradeoff:
+
+- Heap is simple and good for application memory.
+- Redis sorted set is better when multiple servers need the same priority inbox state.
+- Redis needs cache invalidation when notifications are read or expired.
+
+## Stage 6 Output
+
+The script prints the top 10 priority notifications in terminal and also generates a screenshot file. The screenshot proves the output without depending on manual copying from terminal.
