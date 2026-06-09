@@ -921,3 +921,259 @@ WHERE
 ## Final Database Choice
 
 PostgreSQL should be used as the main persistent database. Redis can be added later for unread count caching and real-time Pub/Sub support, but PostgreSQL remains the reliable source of truth for notification data.
+
+# Stage 3
+
+# Query Performance Review
+
+The old query is:
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+## Is This Query Accurate?
+
+This query may work only if the `notifications` table stores one row per student per notification. But that design is not fully accurate for a notification system.
+
+A notification is usually created once and then delivered to many students. If the same notification is copied into the `notifications` table for every student, the table will grow very fast and repeated content will be stored many times.
+
+A better relational design is:
+
+- `notifications`: stores the actual notification content.
+- `student_notifications`: stores student-specific delivery and read/unread status.
+
+So, in the schema suggested in Stage 2, `studentID` and `isRead` should not be directly inside the main `notifications` table. They should be in `student_notifications`.
+
+## Why Is It Slow?
+
+The query is slow because the table has grown to 5,000,000 rows. If proper indexes are not present, the database may scan a large part of the table to find rows where:
+
+```sql
+studentID = 1042
+AND isRead = false
+```
+
+After filtering, it also has to sort the matching rows by:
+
+```sql
+createdAt ASC
+```
+
+Main reasons for slowness:
+
+- `SELECT *` fetches every column even if the API needs only a few fields.
+- No suitable composite index may exist for `studentID`, `isRead`, and `createdAt`.
+- Sorting becomes costly when the database cannot use an index for `ORDER BY`.
+- If all notifications are stored in one table, the table becomes too large and repetitive.
+- Boolean columns like `isRead` alone are not very selective, so indexing only `isRead` will not help much.
+
+## What I Would Change
+
+If keeping the old single-table design, I would avoid `SELECT *` and add a composite index.
+
+```sql
+CREATE INDEX idx_notifications_student_read_created
+ON notifications(studentID, isRead, createdAt);
+```
+
+Improved query:
+
+```sql
+SELECT
+  id,
+  title,
+  message,
+  notificationType,
+  createdAt
+FROM notifications
+WHERE
+  studentID = 1042
+  AND isRead = false
+ORDER BY createdAt ASC
+LIMIT 50;
+```
+
+The `LIMIT` is important because an API should not return unlimited unread notifications in one response.
+
+## Better Query Using Stage 2 Schema
+
+With the normalized schema:
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  n.created_at,
+  n.action_url
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = '1042'
+  AND sn.is_read = FALSE
+  AND n.deleted_at IS NULL
+ORDER BY sn.delivered_at ASC
+LIMIT 50;
+```
+
+Recommended index:
+
+```sql
+CREATE INDEX idx_student_notifications_student_read_delivered
+ON student_notifications(student_id, is_read, delivered_at);
+```
+
+If most APIs sort by newest first, then use:
+
+```sql
+CREATE INDEX idx_student_notifications_student_read_delivered_desc
+ON student_notifications(student_id, is_read, delivered_at DESC);
+```
+
+## Likely Computation Cost
+
+Without a useful index:
+
+```text
+O(N) scan + O(K log K) sort
+```
+
+Where:
+
+- `N` is total rows in the table, around 5,000,000.
+- `K` is the number of unread notifications found for the student.
+
+This means the database may inspect millions of rows before returning the result.
+
+With a composite index on `(studentID, isRead, createdAt)`:
+
+```text
+O(log N + K)
+```
+
+The database can jump directly to the matching student and unread rows using the index, and because `createdAt` is already part of the index, it can avoid a separate sort.
+
+With pagination:
+
+```text
+O(log N + page_size)
+```
+
+For example, if the API returns 50 notifications, the database only needs to fetch around 50 matching rows after locating the correct index range.
+
+## Should We Add Indexes On Every Column?
+
+No, adding indexes on every column is not effective.
+
+Indexes improve read queries only when they match the query pattern. Adding too many indexes creates other problems:
+
+- Inserts become slower because every index must also be updated.
+- Updates become slower, especially when indexed columns are changed.
+- Indexes consume extra disk space.
+- The query planner may have too many options and still not choose a useful one.
+- Single-column indexes may not help queries that filter and sort using multiple columns.
+
+For this API, a composite index is better than many random indexes because the query filters by student, filters by read status, and sorts by created time.
+
+Good index:
+
+```sql
+CREATE INDEX idx_notifications_student_read_created
+ON notifications(studentID, isRead, createdAt);
+```
+
+Less useful indexes:
+
+```sql
+CREATE INDEX idx_notifications_student ON notifications(studentID);
+CREATE INDEX idx_notifications_read ON notifications(isRead);
+CREATE INDEX idx_notifications_created ON notifications(createdAt);
+```
+
+These separate indexes may not avoid sorting and may still require extra filtering.
+
+## Query To Find Students Who Got Placement Notification In Last 7 Days
+
+Given table column:
+
+```text
+notificationType notification_type
+```
+
+Where enum values are:
+
+```text
+Event, Result, Placement
+```
+
+If using the old single-table design:
+
+```sql
+SELECT DISTINCT
+  studentID
+FROM notifications
+WHERE
+  notificationType = 'Placement'
+  AND createdAt >= CURRENT_TIMESTAMP - INTERVAL '7 days';
+```
+
+For MySQL, the interval syntax will be:
+
+```sql
+SELECT DISTINCT
+  studentID
+FROM notifications
+WHERE
+  notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL 7 DAY;
+```
+
+Recommended index for this query:
+
+```sql
+CREATE INDEX idx_notifications_type_created_student
+ON notifications(notificationType, createdAt, studentID);
+```
+
+If using the normalized Stage 2 schema:
+
+```sql
+SELECT DISTINCT
+  sn.student_id
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  n.category = 'placement'
+  AND n.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+  AND n.deleted_at IS NULL;
+```
+
+In the exact enum-based naming given in this stage, the normalized version can be written as:
+
+```sql
+SELECT DISTINCT
+  sn.student_id
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  n.notificationType = 'Placement'
+  AND n.createdAt >= CURRENT_TIMESTAMP - INTERVAL '7 days';
+```
+
+Useful indexes:
+
+```sql
+CREATE INDEX idx_notifications_type_created
+ON notifications(notificationType, createdAt);
+
+CREATE INDEX idx_student_notifications_notification_student
+ON student_notifications(notification_id, student_id);
+```
