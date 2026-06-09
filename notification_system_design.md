@@ -478,3 +478,446 @@ data: {"id":"notif_1003","title":"Technical Fest Registration","category":"event
 - On receiving real-time notification, update local list and badge count.
 - Call mark as read API when user opens a notification.
 - On reconnect, call list API again to avoid missing notifications.
+
+# Stage 2
+
+# Persistent Storage Design
+
+For storing notifications reliably, I suggest using PostgreSQL as the primary database.
+
+PostgreSQL is a good choice because notification data has clear relationships. One notification can be targeted to many departments, years, sections, or students, and every student can have a separate read/unread status for the same notification. PostgreSQL also supports transactions, indexes, JSONB fields, pagination, and reliable querying, which are useful for this platform.
+
+MongoDB can also store notification documents, but for this design PostgreSQL is simpler for read tracking, filtering, and reporting.
+
+## Main Tables
+
+## 1. students
+
+Stores basic student details used for targeting notifications.
+
+```sql
+CREATE TABLE students (
+  id VARCHAR(50) PRIMARY KEY,
+  roll_number VARCHAR(30) UNIQUE NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  department VARCHAR(20) NOT NULL,
+  year INTEGER NOT NULL,
+  section VARCHAR(10),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+## 2. notifications
+
+Stores the main notification content.
+
+```sql
+CREATE TABLE notifications (
+  id VARCHAR(50) PRIMARY KEY,
+  title VARCHAR(150) NOT NULL,
+  message TEXT NOT NULL,
+  category VARCHAR(30) NOT NULL CHECK (category IN ('placement', 'event', 'result', 'general')),
+  priority VARCHAR(20) NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+  action_url VARCHAR(255),
+  expires_at TIMESTAMP,
+  created_by VARCHAR(50),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP,
+  deleted_at TIMESTAMP
+);
+```
+
+## 3. notification_targets
+
+Stores target audience rules for a notification.
+
+```sql
+CREATE TABLE notification_targets (
+  id BIGSERIAL PRIMARY KEY,
+  notification_id VARCHAR(50) NOT NULL REFERENCES notifications(id),
+  department VARCHAR(20),
+  year INTEGER,
+  section VARCHAR(10),
+  student_id VARCHAR(50),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+If a notification is for all students, department, year, section, and student_id can be null in one target row.
+
+Examples:
+
+- CSE 4th year: `department = 'CSE'`, `year = 4`
+- One student: `student_id = 'stu_2300320100222'`
+- All students: all target columns null
+
+## 4. student_notifications
+
+Stores delivery/read status for each student.
+
+```sql
+CREATE TABLE student_notifications (
+  id BIGSERIAL PRIMARY KEY,
+  student_id VARCHAR(50) NOT NULL REFERENCES students(id),
+  notification_id VARCHAR(50) NOT NULL REFERENCES notifications(id),
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  delivered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  read_at TIMESTAMP,
+  UNIQUE (student_id, notification_id)
+);
+```
+
+This table helps the frontend show unread count and mark notifications as read without changing the original notification.
+
+## Indexes
+
+Indexes are required because notification list and unread count APIs will be called often.
+
+```sql
+CREATE INDEX idx_notifications_category_created
+ON notifications(category, created_at DESC);
+
+CREATE INDEX idx_notifications_active
+ON notifications(created_at DESC)
+WHERE deleted_at IS NULL;
+
+CREATE INDEX idx_student_notifications_student_read
+ON student_notifications(student_id, is_read);
+
+CREATE INDEX idx_student_notifications_student_created
+ON student_notifications(student_id, delivered_at DESC);
+
+CREATE INDEX idx_notification_targets_rules
+ON notification_targets(department, year, section, student_id);
+```
+
+## API Based SQL Queries
+
+## 1. Create Notification
+
+Used for `POST /notifications`.
+
+```sql
+INSERT INTO notifications (
+  id,
+  title,
+  message,
+  category,
+  priority,
+  action_url,
+  expires_at,
+  created_by
+) VALUES (
+  'notif_1002',
+  'Semester Results Published',
+  'Semester 6 results are now available in the student portal.',
+  'result',
+  'medium',
+  '/results/semester-6',
+  '2026-06-20 18:00:00',
+  'admin_001'
+);
+```
+
+Insert target audience:
+
+```sql
+INSERT INTO notification_targets (
+  notification_id,
+  department,
+  year,
+  section
+) VALUES
+('notif_1002', 'CSE', 3, NULL),
+('notif_1002', 'IT', 3, NULL),
+('notif_1002', 'ECE', 3, NULL);
+```
+
+Create delivery rows for matching students:
+
+```sql
+INSERT INTO student_notifications (student_id, notification_id)
+SELECT DISTINCT s.id, 'notif_1002'
+FROM students s
+JOIN notification_targets nt
+  ON nt.notification_id = 'notif_1002'
+WHERE
+  (
+    nt.student_id IS NULL
+    OR nt.student_id = s.id
+  )
+  AND (
+    nt.department IS NULL
+    OR nt.department = s.department
+  )
+  AND (
+    nt.year IS NULL
+    OR nt.year = s.year
+  )
+  AND (
+    nt.section IS NULL
+    OR nt.section = s.section
+  )
+ON CONFLICT (student_id, notification_id) DO NOTHING;
+```
+
+## 2. Get Notifications
+
+Used for `GET /notifications?category=placement&status=unread&page=1&limit=10`.
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  sn.is_read,
+  n.created_at,
+  n.expires_at,
+  n.action_url
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = 'stu_2300320100222'
+  AND n.deleted_at IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > CURRENT_TIMESTAMP)
+  AND n.category = 'placement'
+  AND sn.is_read = FALSE
+ORDER BY sn.delivered_at DESC
+LIMIT 10 OFFSET 0;
+```
+
+For `page = 2`, offset will be `(2 - 1) * 10 = 10`.
+
+## 3. Get Notification Details
+
+Used for `GET /notifications/{notificationId}`.
+
+```sql
+SELECT
+  n.id,
+  n.title,
+  n.message,
+  n.category,
+  n.priority,
+  sn.is_read,
+  sn.read_at,
+  n.created_at,
+  n.expires_at,
+  n.action_url
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = 'stu_2300320100222'
+  AND n.id = 'notif_1001'
+  AND n.deleted_at IS NULL;
+```
+
+## 4. Mark Notification As Read
+
+Used for `PATCH /notifications/{notificationId}/read`.
+
+```sql
+UPDATE student_notifications
+SET
+  is_read = TRUE,
+  read_at = CURRENT_TIMESTAMP
+WHERE
+  student_id = 'stu_2300320100222'
+  AND notification_id = 'notif_1001';
+```
+
+## 5. Mark All Notifications As Read
+
+Used for `PATCH /notifications/read-all`.
+
+```sql
+UPDATE student_notifications sn
+SET
+  is_read = TRUE,
+  read_at = CURRENT_TIMESTAMP
+FROM notifications n
+WHERE
+  n.id = sn.notification_id
+  AND sn.student_id = 'stu_2300320100222'
+  AND sn.is_read = FALSE
+  AND n.deleted_at IS NULL
+  AND n.category = 'placement';
+```
+
+If no category filter is passed, remove the last condition.
+
+## 6. Get Unread Count
+
+Used for `GET /notifications/unread-count`.
+
+```sql
+SELECT
+  COUNT(*) AS total_unread
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = 'stu_2300320100222'
+  AND sn.is_read = FALSE
+  AND n.deleted_at IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > CURRENT_TIMESTAMP);
+```
+
+Category-wise unread count:
+
+```sql
+SELECT
+  n.category,
+  COUNT(*) AS unread_count
+FROM student_notifications sn
+JOIN notifications n
+  ON n.id = sn.notification_id
+WHERE
+  sn.student_id = 'stu_2300320100222'
+  AND sn.is_read = FALSE
+  AND n.deleted_at IS NULL
+  AND (n.expires_at IS NULL OR n.expires_at > CURRENT_TIMESTAMP)
+GROUP BY n.category;
+```
+
+## 7. Update Notification
+
+Used for `PUT /notifications/{notificationId}`.
+
+```sql
+UPDATE notifications
+SET
+  title = 'Semester 6 Results Published',
+  message = 'Semester 6 results are available now.',
+  category = 'result',
+  priority = 'medium',
+  action_url = '/results/semester-6',
+  expires_at = '2026-06-20 18:00:00',
+  updated_at = CURRENT_TIMESTAMP
+WHERE
+  id = 'notif_1002'
+  AND deleted_at IS NULL;
+```
+
+## 8. Delete Notification
+
+Used for `DELETE /notifications/{notificationId}`.
+
+Soft delete is better than hard delete because it keeps history.
+
+```sql
+UPDATE notifications
+SET deleted_at = CURRENT_TIMESTAMP
+WHERE id = 'notif_1002';
+```
+
+## Data Volume Problems
+
+As the number of students and notifications increases, these problems may come:
+
+- `student_notifications` table can become very large because one notification may create rows for thousands of students.
+- Notification list API can become slow if indexes are missing.
+- Unread count API can be called too frequently from frontend.
+- Old expired notifications can keep increasing storage size.
+- Creating delivery rows for a large audience can take time.
+- Real-time broadcasting can put load on one backend server.
+
+## Solutions For Scaling
+
+## 1. Proper Indexing
+
+Use indexes on student id, read status, category, and delivered time. This keeps list and count APIs fast.
+
+## 2. Pagination
+
+Always use pagination for notification list. Do not return all notifications in one API response.
+
+## 3. Archival
+
+Move old expired notifications to archive tables after a fixed period.
+
+```sql
+CREATE TABLE archived_notifications AS
+SELECT *
+FROM notifications
+WHERE false;
+```
+
+Example archive query:
+
+```sql
+INSERT INTO archived_notifications
+SELECT *
+FROM notifications
+WHERE expires_at < CURRENT_TIMESTAMP - INTERVAL '90 days';
+```
+
+## 4. Partitioning
+
+Partition large tables by month or year using `created_at` or `delivered_at`.
+
+Example:
+
+```sql
+CREATE TABLE student_notifications_2026_06
+PARTITION OF student_notifications
+FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+```
+
+In real implementation, `student_notifications` should be created as a partitioned table first.
+
+## 5. Cache Unread Count
+
+Unread count can be stored in Redis to reduce database hits. Whenever a new notification is delivered, increment the count. Whenever student marks it read, decrement it.
+
+Example cache key:
+
+```text
+unread_count:stu_2300320100222
+```
+
+## 6. Background Jobs
+
+For large target audiences, do not create all `student_notifications` rows inside the request cycle. The API can create the notification and push a job to a queue. A worker can process delivery rows in batches.
+
+Example batches:
+
+```sql
+INSERT INTO student_notifications (student_id, notification_id)
+SELECT id, 'notif_1002'
+FROM students
+WHERE department = 'CSE' AND year = 3
+LIMIT 1000;
+```
+
+## 7. WebSocket Scaling
+
+For multiple backend servers, use Redis Pub/Sub, Kafka, or RabbitMQ so every server receives the notification event and sends it to connected students.
+
+Simple flow:
+
+1. API stores notification in PostgreSQL.
+2. API publishes event to message broker.
+3. WebSocket servers receive event.
+4. WebSocket servers send it only to matching connected students.
+
+## 8. Cleanup Job
+
+Run a scheduled cleanup job to expire old notifications and archive data.
+
+```sql
+UPDATE notifications
+SET deleted_at = CURRENT_TIMESTAMP
+WHERE
+  expires_at IS NOT NULL
+  AND expires_at < CURRENT_TIMESTAMP - INTERVAL '180 days'
+  AND deleted_at IS NULL;
+```
+
+## Final Database Choice
+
+PostgreSQL should be used as the main persistent database. Redis can be added later for unread count caching and real-time Pub/Sub support, but PostgreSQL remains the reliable source of truth for notification data.
